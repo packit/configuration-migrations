@@ -30,7 +30,7 @@ def is_package_config_affected(package_config: str) -> bool:
         build_jobs_with_same_trigger = [
             job
             for job in jobs
-            if job.get("job") in (JobType.copr_build.value, JobType.build.value)
+            if job.get("job") == JobType.copr_build.value
             and job.get("trigger") == test_job.get("trigger")
         ]
         if not build_jobs_with_same_trigger:
@@ -80,7 +80,7 @@ def get_affected_test_jobs(jobs: list) -> list:
         build_jobs = [
             job
             for job in jobs
-            if job.get("job") in (JobType.copr_build.value, JobType.build.value)
+            if job.get("job") == JobType.copr_build.value
             and job.get("trigger") == test_job.get("trigger")
         ]
         if not build_jobs:
