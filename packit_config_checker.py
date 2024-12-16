@@ -10,6 +10,8 @@ import logging
 import os
 import re
 import time
+import tempfile
+import git
 from datetime import datetime
 from os import getenv
 from pathlib import Path
@@ -19,10 +21,11 @@ from urllib.parse import urlparse
 import click
 import requests
 
-from ogr import get_project, GithubService, GitlabService
+from ogr import get_project, GithubService, GitlabService, PagureService
 from ogr.abstract import GitProject
 from ogr.services.github import GithubProject
 from ogr.services.gitlab import GitlabProject
+from ogr.services.pagure import PagureProject
 from packit.config.package_config import find_remote_package_config
 
 logger = logging.getLogger(__name__)
@@ -45,6 +48,7 @@ services = {
     GitlabService(
         instance_url="https://salsa.debian.org", token=getenv("SALSA_DEBIAN_TOKEN")
     ),
+    PagureService(instance_url="https://src.fedoraproject.org", token=getenv("PAGURE_TOKEN")),
 }
 
 
@@ -211,6 +215,9 @@ class PackageConfigUpdater:
         if isinstance(self.project, GitlabProject):
             return self.commit_file_in_new_branch_gitlab()
 
+        if isinstance(self.project, PagureProject):
+            return self.commit_file_in_new_branch_pagure()
+
     def commit_file_in_new_branch_github(self):
         commit = self.project.github_repo.get_commit(
             f"refs/heads/{self.project.default_branch}"
@@ -254,6 +261,62 @@ class PackageConfigUpdater:
             return False
 
         return True
+
+    def commit_file_in_new_branch_pagure(self):
+        commit_sha = self.project.get_sha_from_branch(self.project.default_branch)
+        fork_commit_sha = self.fork.get_sha_from_branch(self.fork.default_branch)
+
+        directory = tempfile.mkdtemp()
+        url = self.fork.get_git_urls()["ssh"]
+        git_repo = git.repo.Repo.clone_from(url=url, to_path=directory, tags=True)
+        origin = git_repo.remote("origin")
+
+        if commit_sha != fork_commit_sha:
+            click.echo(
+                "Fork is not synced with the parent repo"
+            )
+            upstream = git_repo.create_remote(
+                name="upstream",
+                url=self.project.get_git_urls()["ssh"],
+            )
+            upstream.fetch()
+            branch_name = git_repo.active_branch.name
+            head = git_repo.heads[branch_name]
+            upstream_head = upstream.refs[branch_name]
+            head.set_commit(upstream_head)
+            origin.push(refspec=head)
+
+
+        parent_default_branch = [branch for branch in git_repo.branches 
+                                 if branch.name == self.project.default_branch][0]
+        parent_commit = parent_default_branch.commit
+
+        refs = [
+            branch
+            for branch in git_repo.branches
+            if branch.name == SOURCE_BRANCH
+        ]
+        if refs:
+            ref = refs[0]
+        else:
+            ref = git_repo.create_head(SOURCE_BRANCH, parent_commit)
+
+        git_repo.head.reference = ref
+        git_repo.head.reset(index=True, working_tree=True)
+
+        file = os.path.join(git_repo.working_tree_dir, self.config_file_name)
+        with open(file, "w") as f:
+            f.write(self.updated_packit_config)
+        git_repo.index.add([file])
+        git_repo.index.commit(self.commit_msg)
+        try:
+            origin.push(refspec=SOURCE_BRANCH)
+            git_repo.head.reference.set_tracking_branch(getattr(origin.refs, SOURCE_BRANCH))
+        except Exception as ex:
+            click.echo(f"Updating file raised an exception: {ex}")
+            return False
+
+        return True       
 
     def commit_file_in_new_branch_gitlab(self):
         parent_default_branch = self.project.gitlab_repo.branches.get(
@@ -307,7 +370,11 @@ class PackageConfigUpdater:
             )
             return False
 
-        if not self.commit_file_in_new_branch():
+        try:
+            if not self.commit_file_in_new_branch():
+                return False
+        except Exception as ex:
+            click.echo(f"There was an error while creating the commit: {ex!r}")
             return False
 
         if not click.confirm(
@@ -483,6 +550,11 @@ def show_diff(old_package_config: str, new_package_config: str):
     If you want to create the updates, you need to specify the
     GITHUB_TOKEN env var (and additionally
     GITLAB_TOKEN, GITLAB_GNOME_TOKEN, GITLAB_FREEDESKTOP_TOKEN depending on the affected projects).
+
+
+    For working with src.fedoraproject.org (as packit user), you need to:
+        - run kinit packit@FEDORAPROJECT.ORG -k -t /path/to/deployment/secrets/packit/prod/fedora.keytab
+        - export GIT_SSH_COMMAND='ssh -i /path/to/deployment/secrets/packit/prod/id_ed25519 -o IdentitiesOnly=yes'
 
     Requires calling download-configs first.
     """
